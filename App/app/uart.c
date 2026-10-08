@@ -59,6 +59,12 @@
     #include "apps/app_overlay.h"
 #endif
 
+#ifdef ENABLE_FEAT_F4HWN_OVERLAY_SAT
+    #include "apps/sat/sat_format.h"
+    #include "driver/py25q16.h"
+    #include "scheduler.h"
+#endif
+
 #if defined(ENABLE_OVERLAY)
     #include "sram-overlay.h"
 #endif
@@ -1389,6 +1395,115 @@ void UART_HandleCommand(uint32_t Port)
             SendReply(Port, &Reply, sizeof(Reply));
             break;
         }
+
+#ifdef ENABLE_FEAT_F4HWN_OVERLAY_SAT
+        // Sat Track pass store (apps/sat/sat_format.h), same auth as the app slots
+        case 0x0740: // read: {sector, -, offset u16, len u8} -> 0x0741 {sector, status, len, data}
+        {
+            if (pUART_Command->Header.Size < 5u) break;
+            gSerialConfigCountDown_500ms = 12;
+            const uint8_t  sector = pUART_Command->Data[0];
+            const uint16_t offset = (uint16_t)(pUART_Command->Data[2] | (pUART_Command->Data[3] << 8));
+            uint8_t        len    = pUART_Command->Data[4];
+            struct __attribute__((packed)) {
+                Header_t Header;
+                uint8_t  Sector;
+                uint8_t  Status;
+                uint8_t  Len;
+                uint8_t  Pad;
+                uint8_t  Data[128];
+            } Reply;
+            Reply.Status = 0;
+            if (sector >= SAT_SECTOR_COUNT || len > sizeof(Reply.Data) ||
+                (uint32_t)offset + len > SAT_SECTOR_SIZE) {
+                Reply.Status = 1;
+                len = 0;
+            } else {
+                PY25Q16_ReadBuffer(SAT_STORE_BASE + sector * SAT_SECTOR_SIZE + offset, Reply.Data, len);
+            }
+            Reply.Header.ID   = 0x0741;
+            Reply.Header.Size = (uint16_t)(4u + len);
+            Reply.Sector      = sector;
+            Reply.Len         = len;
+            Reply.Pad         = 0;
+            SendReply(Port, &Reply, (uint16_t)(sizeof(Header_t) + 4u + len));
+            break;
+        }
+
+        case 0x0742: // erase: {sector (0xFF = all), -, ts u32} -> 0x0743 {sector, status}
+        {
+            if (pUART_Command->Header.Size < 6u) break;
+            gSerialConfigCountDown_500ms = 12;
+            const uint8_t  sector = pUART_Command->Data[0];
+            const uint32_t ts     = (uint32_t)pUART_Command->Data[2]
+                                  | ((uint32_t)pUART_Command->Data[3] << 8)
+                                  | ((uint32_t)pUART_Command->Data[4] << 16)
+                                  | ((uint32_t)pUART_Command->Data[5] << 24);
+            uint8_t status = 0;
+            if (ts != mb_port_timestamp(Port))
+                status = 2;
+            else if (sector == 0xFFu)
+                for (uint8_t i = 0; i < SAT_SECTOR_COUNT; i++)
+                    PY25Q16_SectorErase(SAT_STORE_BASE + i * SAT_SECTOR_SIZE);
+            else if (sector < SAT_SECTOR_COUNT)
+                PY25Q16_SectorErase(SAT_STORE_BASE + sector * SAT_SECTOR_SIZE);
+            else
+                status = 1;
+            PY25Q16_InvalidateCache();
+            struct __attribute__((packed)) { Header_t Header; uint8_t Sector; uint8_t Status; } Reply;
+            Reply.Header.ID   = 0x0743;
+            Reply.Header.Size = 2;
+            Reply.Sector      = sector;
+            Reply.Status      = status;
+            SendReply(Port, &Reply, sizeof(Reply));
+            break;
+        }
+
+        case 0x0744: // write: {sector, -, offset u32, len u16, ts u32, data} -> 0x0745 {sector, status}
+        {
+            if (pUART_Command->Header.Size < 12u) break;
+            gSerialConfigCountDown_500ms = 12;
+            const uint8_t  sector = pUART_Command->Data[0];
+            const uint32_t offset = (uint32_t)pUART_Command->Data[2]
+                                  | ((uint32_t)pUART_Command->Data[3] << 8)
+                                  | ((uint32_t)pUART_Command->Data[4] << 16)
+                                  | ((uint32_t)pUART_Command->Data[5] << 24);
+            const uint16_t len    = (uint16_t)(pUART_Command->Data[6] | (pUART_Command->Data[7] << 8));
+            const uint32_t ts     = (uint32_t)pUART_Command->Data[8]
+                                  | ((uint32_t)pUART_Command->Data[9] << 8)
+                                  | ((uint32_t)pUART_Command->Data[10] << 16)
+                                  | ((uint32_t)pUART_Command->Data[11] << 24);
+            uint8_t status = 0;
+            if (ts != mb_port_timestamp(Port))
+                status = 2;
+            else if (sector >= SAT_SECTOR_COUNT || len > pUART_Command->Header.Size - 12u ||
+                     offset > SAT_SECTOR_SIZE || len > SAT_SECTOR_SIZE - offset)
+                status = 1;
+            else {
+                PY25Q16_WriteBuffer(SAT_STORE_BASE + sector * SAT_SECTOR_SIZE + offset,
+                                    &pUART_Command->Data[12], len, false);
+                PY25Q16_InvalidateCache();
+            }
+            struct __attribute__((packed)) { Header_t Header; uint8_t Sector; uint8_t Status; } Reply;
+            Reply.Header.ID   = 0x0745;
+            Reply.Header.Size = 2;
+            Reply.Sector      = sector;
+            Reply.Status      = status;
+            SendReply(Port, &Reply, sizeof(Reply));
+            break;
+        }
+
+        case 0x0746: // ticks: -> 0x0747 {u32 10 ms ticks}, for host clock calibration
+        {
+            gSerialConfigCountDown_500ms = 12;
+            struct __attribute__((packed)) { Header_t Header; uint32_t Ticks; } Reply;
+            Reply.Header.ID   = 0x0747;
+            Reply.Header.Size = 4;
+            Reply.Ticks       = SCHEDULER_GetTick10ms();
+            SendReply(Port, &Reply, sizeof(Reply));
+            break;
+        }
+#endif
 #endif
 
 #ifdef ENABLE_UART_RW_BK_REGS

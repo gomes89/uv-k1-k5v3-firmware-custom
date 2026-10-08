@@ -104,6 +104,7 @@
 /* BEAM channel bridge only (beam_prepare/get/save/draw); the app drives the
  * FSK modem itself through bk_read/bk_write. */
 #define APP_CAP_BEAM2         0x00000010u
+#define APP_CAP_SAT           0x00000020u   /* Sat Track pass store + RF bridge */
 
 /* Aligned RAM objects; app_overlay.c pins every serialized field offset. */
 typedef struct {

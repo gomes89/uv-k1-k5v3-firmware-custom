@@ -37,6 +37,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 /* API levels within ABI major 1, one per published release (what a release
  * ships is frozen; services added before the next release join its level):
@@ -45,7 +46,7 @@
  *      idivmod, uidivmod (the resident division helpers), Labs system info,
  *      current and minimum-since-boot free stack/RAM margin */
 #define APP_ABI_MAJOR  1u
-#define APP_API_LEVEL  2u
+#define APP_API_LEVEL  3u   /* 3  satellite pass bridge (sat_*, APP_CAP_SAT) */
 
 /* Minimum API level of an app that ships read-only assets (pack_app.py). */
 #define APP_API_ASSETS 2u
@@ -263,8 +264,10 @@ typedef struct app_api {
     uint64_t (*idivmod)(int32_t n, int32_t d);
     uint64_t (*uidivmod)(uint32_t n, uint32_t d);
 
-#ifdef ENABLE_FEAT_F4HWN_OVERLAY_INFO
-    /* ---- API level 2: zero-code Labs system information ---- */
+    /* ---- API level 2: zero-code Labs system information ----
+     * Always present in the layout (NULL unless APP_CAP_SYSINFO), so that
+     * every later level sits at the same offset in every build. Labs builds
+     * already had these fields here; for other builds this is a pure append. */
     const char *sys_edition;
     const char *sys_version;
     const char *sys_build_date;
@@ -280,13 +283,44 @@ typedef struct app_api {
     /* ---- API level 2: stack watermark diagnostics ---- */
     uint32_t (*sys_stack_free_now)(void);
     uint32_t (*sys_stack_free_min)(void);
-#endif
+
+    /* ---- API level 3: shared helpers, then the satellite pass bridge ----
+     * crc16 is CRC-16/XMODEM (init 0) over buf; to continue a CRC c over a
+     * further chunk, XOR c into its first two bytes (high byte first). The
+     * format is the firmware's snprintf (minimal profile): %d %u %c %s,
+     * 0/+/space flags and a width. */
+    uint16_t (*crc16)(const void *buf, uint16_t len);
+    int      (*format)(char *buf, size_t n, const char *fmt, ...);
+
+    /* Satellite pass bridge (APP_CAP_SAT).
+     * sat_read reads the Sat Track pass store (apps/sat/sat_format.h) and
+     * nothing else; it bypasses the sector cache, so it is safe while the app
+     * runs. The RF calls drive one private resident VFO cloned from the
+     * selected one (power, bandwidth, squelch level come from there). */
+    bool     (*sat_read)(uint32_t offset, void *buf, uint16_t len);
+    void     (*sat_enter)(void);
+    void     (*sat_tune)(uint32_t rx, uint32_t tx, uint16_t ctcss_01hz,
+                         uint8_t modulation);  /* full reconfigure; tx 0 = RX only */
+    void     (*sat_rx)(uint32_t rx);           /* fast PLL retune; ignored in TX   */
+    uint8_t  (*sat_tick)(void);                /* every ~20 ms, returns APP_SAT_*  */
+    uint8_t  (*sat_ptt)(bool pressed, uint32_t tx); /* 0 = OK, else TX denied      */
+    void     (*sat_leave)(void);
+    uint8_t  (*sat_squelch)(int8_t delta);     /* +/-1 like F+UP/DOWN, 0 = read    */
+    const char *(*sat_power)(void);            /* TX power name, as the TXP menu   */
 } app_api_t;
 
-#ifdef ENABLE_FEAT_F4HWN_OVERLAY_INFO
-_Static_assert(sizeof(app_api_t) == 328u,
-               "Labs system information must add exactly 52 API bytes");
+#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4
+/* The level-2 layout shipped in v6.1.0 is frozen: level 3 starts at 328. */
+_Static_assert(__builtin_offsetof(app_api_t, crc16) == 328u,
+               "API level 2 layout changed");
 #endif
+
+/* sat_tick() states */
+enum {
+    APP_SAT_IDLE = 0,   /* squelch closed       */
+    APP_SAT_RX   = 1,   /* squelch open, audio  */
+    APP_SAT_TX   = 2,   /* transmitting         */
+};
 
 /* BK4819 AF modes for set_af (mirror driver/bk4819.h values). */
 enum { APP_AF_MUTE = 0, APP_AF_FM = 1, APP_AF_AM = 7 };

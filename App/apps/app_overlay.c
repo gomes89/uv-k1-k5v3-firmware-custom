@@ -43,6 +43,7 @@
 #endif
 #include "ui/helper.h"
 #include "ui/main.h"
+#include "ui/menu.h"   /* gSubMenu_TXP */
 #include "ui/status.h"
 #include "board.h"
 #include "audio.h"
@@ -53,7 +54,12 @@
 #include "scheduler.h"
 #include "helper/battery.h"
 #include "settings.h"
+#include "driver/crc.h"
+#include "external/printf/printf.h"
 #include "misc.h"   /* dBmCorrTable */
+#ifdef ENABLE_FEAT_F4HWN_OVERLAY_SAT
+#include "apps/sat/sat_format.h"
+#endif
 #ifdef ENABLE_FEAT_F4HWN_OVERLAY_INFO
 #include "version.h"
 #include "stack_usage.h"
@@ -92,6 +98,9 @@ enum {
 #endif
 #ifdef ENABLE_FEAT_F4HWN_OVERLAY_INFO
                        | APP_CAP_SYSINFO
+#endif
+#ifdef ENABLE_FEAT_F4HWN_OVERLAY_SAT
+                       | APP_CAP_SAT
 #endif
 };
 
@@ -196,12 +205,15 @@ extern uint8_t _ebss;
 #endif
 static void    app_led(bool on)        { BK4819_ToggleGpioOut(BK4819_GPIO6_PIN2_GREEN, on); }
 
+/* As AUDIO_PlayBeep: let the amplifier wake up, and turn RX back on after. */
 static void app_play_tone(uint16_t tone, uint16_t ms)
 {
     BK4819_PrepareToPlayTone(true);
     AUDIO_AudioPathOn();
+    SYSTEM_DelayMs(60);
     BK4819_PlayToneRaw(tone, ms);
     AUDIO_AudioPathOff();
+    BK4819_TurnsOffTones_TurnsOnRX();
 }
 
 #ifdef ENABLE_FEAT_F4HWN_OVERLAY_BEAM
@@ -663,6 +675,207 @@ uint8_t APP_SlotInfo(uint8_t slot, app_header_t *out_header)
  * roughly quarter-kilobyte automatic object on every launch and removes that
  * object from the launcher's stack frame.  Callbacks must also obey the ABI's
  * no-external-flash-write rule while entry() is running. */
+#ifdef ENABLE_FEAT_F4HWN_OVERLAY_SAT
+/* ---- optional Sat Track bridge --------------------------------------------
+ * The app owns the pass playback, the Doppler maths and the UI. Resident code
+ * only reads the pass store and drives a private copy of the selected VFO, so
+ * power, bandwidth and squelch follow the user's settings and nothing is
+ * saved. */
+static VFO_Info_t  app_sat_vfo;
+static VFO_Info_t *app_sat_saved_rx;
+static VFO_Info_t *app_sat_saved_tx;
+static VFO_Info_t *app_sat_saved_current;
+static uint32_t    app_sat_tx_ticks;
+static uint8_t     app_sat_settle;
+static bool        app_sat_running;
+static bool        app_sat_transmitting;
+static bool        app_sat_receiving;
+static bool        app_sat_sql_open;
+
+static bool app_sat_read(uint32_t offset, void *buf, uint16_t len)
+{
+    if (buf == NULL || offset > SAT_STORE_SIZE || len > SAT_STORE_SIZE - offset)
+        return false;
+    PY25Q16_ReadBuffer(SAT_STORE_BASE + offset, buf, len);
+    return true;
+}
+
+static void app_sat_audio(bool on)
+{
+    app_sat_receiving = on;
+    gEnableSpeaker = on;
+    if (on) {
+        AUDIO_AudioPathOn();
+        BK4819_SetRxAudioGain();
+        RADIO_SetModulation(app_sat_vfo.Modulation);   /* SetupSquelch left AF muted */
+    } else {
+        AUDIO_AudioPathOff();
+    }
+    BK4819_ToggleGpioOut(BK4819_GPIO6_PIN2_GREEN, on);
+}
+
+static void app_sat_retune_full(void)
+{
+    app_sat_audio(false);
+    app_sat_sql_open = false;
+    app_sat_settle = 10u;                 /* 200 ms at the app's 20 ms tick */
+    gRxVfo = gTxVfo = gCurrentVfo = &app_sat_vfo;
+    RADIO_SetupRegisters(false);
+    FUNCTION_Init();
+}
+
+static void app_sat_enter(void)
+{
+    app_sat_saved_rx      = gRxVfo;
+    app_sat_saved_tx      = gTxVfo;
+    app_sat_saved_current = gCurrentVfo;
+
+    app_sat_vfo = *gTxVfo;                /* user's power/bandwidth/compander */
+    app_sat_vfo.FrequencyReverse = 0;
+    app_sat_vfo.TX_OFFSET_FREQUENCY = 0;
+    app_sat_vfo.TX_OFFSET_FREQUENCY_DIRECTION = 0;
+    app_sat_vfo.pRX = &app_sat_vfo.freq_config_RX;   /* never alias the source VFO */
+    app_sat_vfo.pTX = &app_sat_vfo.freq_config_TX;
+
+    app_sat_running = true;
+    app_sat_transmitting = false;
+}
+
+static void app_sat_tune(uint32_t rx, uint32_t tx, uint16_t ctcss_01hz, uint8_t modulation)
+{
+    if (!app_sat_running || app_sat_transmitting)
+        return;
+    VFO_Info_t *v = &app_sat_vfo;
+    v->freq_config_RX.Frequency = rx;
+    v->freq_config_RX.CodeType  = CODE_TYPE_OFF;   /* satellites: open RX */
+    v->freq_config_RX.Code      = 0;
+    v->freq_config_TX.Frequency = tx ? tx : rx;
+    v->freq_config_TX.CodeType  = ctcss_01hz ? CODE_TYPE_CONTINUOUS_TONE : CODE_TYPE_OFF;
+    v->freq_config_TX.Code      = ctcss_01hz ? DCS_GetCtcssCode(ctcss_01hz) : 0;
+    v->TX_LOCK    = (tx == 0u);                    /* RX-only pass */
+    v->Modulation = (modulation < MODULATION_UKNOWN) ? (ModulationMode_t)modulation
+                                                     : MODULATION_FM;
+    v->Band       = FREQUENCY_GetBand(rx);
+    RADIO_ConfigureSquelchAndOutputPower(v);       /* RX squelch by RX band, TXP by TX band */
+    app_sat_retune_full();
+}
+
+static void app_sat_rx(uint32_t rx)
+{
+    if (!app_sat_running || app_sat_transmitting)
+        return;
+    app_sat_vfo.freq_config_RX.Frequency = rx;     /* survives a later full setup */
+    BK4819_SetFrequency(rx);
+    BK4819_PickRXFilterPathBasedOnFrequency(rx);
+    const uint16_t reg = BK4819_ReadRegister(BK4819_REG_30);
+    BK4819_WriteRegister(BK4819_REG_30, 0);
+    BK4819_WriteRegister(BK4819_REG_30, reg);
+}
+
+static void app_sat_end_tx(void)
+{
+    if (!app_sat_transmitting)
+        return;
+    RADIO_SendEndOfTransmission();
+    app_sat_transmitting = false;
+    BK4819_ToggleGpioOut(BK4819_GPIO5_PIN1_RED, false);
+    app_sat_retune_full();
+}
+
+static uint8_t app_sat_tick(void)
+{
+    if (!app_sat_running)
+        return APP_SAT_IDLE;
+
+    if (app_sat_transmitting) {
+        /* TOT budget at the app's 20 ms tick. */
+        const uint32_t timeout = ((uint32_t)gEeprom.TX_TIMEOUT_TIMER + 1u) * 250u;
+        if (++app_sat_tx_ticks >= timeout) {
+            app_sat_end_tx();
+            return APP_SAT_IDLE;
+        }
+        return APP_SAT_TX;
+    }
+
+    while (BK4819_ReadRegister(BK4819_REG_0C) & 1u) {
+        BK4819_WriteRegister(BK4819_REG_02, 0);
+        const uint16_t irq = BK4819_ReadRegister(BK4819_REG_02);
+        if (irq & BK4819_REG_02_SQUELCH_LOST)  app_sat_sql_open = true;
+        if (irq & BK4819_REG_02_SQUELCH_FOUND) app_sat_sql_open = false;
+    }
+    if (app_sat_settle > 0u) {
+        app_sat_settle--;
+        return APP_SAT_IDLE;
+    }
+    /* Squelch 0 is open from the start, so no SQUELCH_LOST ever arrives. */
+    const bool open = app_sat_sql_open || gEeprom.SQUELCH_LEVEL == 0;
+    if (open != app_sat_receiving)
+        app_sat_audio(open);
+    return app_sat_receiving ? APP_SAT_RX : APP_SAT_IDLE;
+}
+
+/* Same as F+UP/DOWN on the main screen. */
+static uint8_t app_sat_squelch(int8_t delta)
+{
+    if (delta && app_sat_running && !app_sat_transmitting) {
+        if (gSquelchLevelOriginal == 10)
+            gSquelchLevelOriginal = gEeprom.SQUELCH_LEVEL;
+        if (delta > 0 && gEeprom.SQUELCH_LEVEL < 9) gEeprom.SQUELCH_LEVEL++;
+        if (delta < 0 && gEeprom.SQUELCH_LEVEL > 0) gEeprom.SQUELCH_LEVEL--;
+        RADIO_ConfigureSquelchAndOutputPower(&app_sat_vfo);
+        app_sat_retune_full();
+    }
+    return gEeprom.SQUELCH_LEVEL;
+}
+
+static uint8_t app_sat_ptt(bool pressed, uint32_t tx)
+{
+    if (!app_sat_running)
+        return 1;
+    if (!pressed) {
+        app_sat_end_tx();
+        return 0;
+    }
+    if (app_sat_transmitting)
+        return 0;
+
+    VFO_Info_t *v = &app_sat_vfo;
+    if (v->TX_LOCK || tx == 0u ||
+        TX_freq_check(tx) != 0 ||                  /* honours the user's TX band locks */
+        v->Modulation != MODULATION_FM ||
+        gBatteryDisplayLevel == 0 || gBatteryDisplayLevel > 6)
+        return 1;
+
+    app_sat_audio(false);
+    v->freq_config_TX.Frequency = tx;              /* Doppler-corrected at key-down */
+    gRxVfo = gTxVfo = gCurrentVfo = v;
+    RADIO_SetTxParameters();
+    BK4819_ToggleGpioOut(BK4819_GPIO5_PIN1_RED, true);
+    BK4819_DisableScramble();
+    app_sat_transmitting = true;
+    app_sat_tx_ticks = 0;
+    return 0;
+}
+
+/* Name of the TX power the private VFO keys with ("LOW 1".."HIGH", "USER"). */
+static const char *app_sat_power(void)
+{
+    return gSubMenu_TXP[app_sat_vfo.OUTPUT_POWER & 7u];
+}
+
+static void app_sat_leave(void)
+{
+    if (!app_sat_running)
+        return;
+    app_sat_end_tx();
+    app_sat_audio(false);
+    app_sat_running = false;
+    gRxVfo      = app_sat_saved_rx;
+    gTxVfo      = app_sat_saved_tx;
+    gCurrentVfo = app_sat_saved_current;
+}
+#endif
+
 static const app_api_t app_api = {
     .abi_major        = APP_ABI_MAJOR,
     .api_level        = APP_API_LEVEL,
@@ -755,6 +968,19 @@ static const app_api_t app_api = {
     .sys_storage_read    = PY25Q16_ReadBuffer,
     .sys_stack_free_now  = STACK_FreeNow,
     .sys_stack_free_min  = STACK_FreeMinimum,
+#endif
+    .crc16               = CRC_Calculate,
+    .format              = snprintf_,
+#ifdef ENABLE_FEAT_F4HWN_OVERLAY_SAT
+    .sat_read            = app_sat_read,
+    .sat_enter           = app_sat_enter,
+    .sat_tune            = app_sat_tune,
+    .sat_rx              = app_sat_rx,
+    .sat_tick            = app_sat_tick,
+    .sat_ptt             = app_sat_ptt,
+    .sat_squelch         = app_sat_squelch,
+    .sat_leave           = app_sat_leave,
+    .sat_power           = app_sat_power,
 #endif
 };
 
@@ -852,6 +1078,9 @@ uint8_t APP_LaunchOverlay(uint8_t slot)
 
     app_entry_t entry = (app_entry_t)(((uint32_t)ws + h.entry_off) | 1u);
     entry(&app_api);
+#ifdef ENABLE_FEAT_F4HWN_OVERLAY_SAT
+    app_sat_leave();            /* defensive: covers an app returning mid-TX */
+#endif
 
     APP_ModalScreenSaverExit();
     app_state.allow_screen_saver = false;
