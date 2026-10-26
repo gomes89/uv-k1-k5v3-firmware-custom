@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from .fmt import HDR_SIZE, PASS_COUNT, PPM_LIMIT, parse_header, parse_index  # noqa: E402
 
-APP_SLOTS, APP_CODE_OFF, APP_ERR_MAGIC = 16, 0x1000, 2
+APP_SLOTS, APP_CODE_OFF, APP_ERR_MAGIC = 48, 0x1000, 2
 
 # Bytes per write command. 128-byte writes (about 150 bytes on the wire) fail
 # over the K-plug programming cable at 38400 baud, 64 works there and on USB-C.
@@ -142,13 +142,14 @@ class Radio:
     def install_app(self, path):
         """Into the slot already holding an app of that name, else the first
         free one. Code first, header last, so a cut-off install never runs.
-        -> slot number (1-based)."""
+        -> (name, version, slot number 1-based)."""
         with open(path, "rb") as f:
             blob = f.read()
         hdr, code = blob[:64], blob[64:]
         if hdr[:4] != b"FAP1":
             raise ValueError(f"{path}: not an overlay app")
         name = hdr[20:36].split(b"\0")[0]
+        version = hdr[36:52].split(b"\0")[0].decode("ascii", "replace")
         slot = free = None
         for i in range(APP_SLOTS):
             r = self.call(0x0730, bytes([i]), 0x0731)
@@ -172,4 +173,4 @@ class Radio:
         r = self.call(0x0736, bytes([slot]), 0x0737)
         if r[5]:
             raise IOError(f"the radio rejected the app (status {r[5]}): firmware without Sat Track support?")
-        return name.decode(), slot + 1
+        return name.decode(), version, slot + 1

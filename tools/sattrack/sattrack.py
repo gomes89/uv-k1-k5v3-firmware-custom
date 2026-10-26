@@ -465,8 +465,8 @@ def cmd_install(cfg, args):
     radio = need_port(cfg, args)
     for f in files:
         if f:
-            name, slot = radio.install_app(f)
-            print(f"Installed {name} in app slot {slot}")
+            name, version, slot = radio.install_app(f)
+            print(f"Installed {name} {version} in app slot {slot}")
 
 
 def cmd_calibrate(cfg, args):
