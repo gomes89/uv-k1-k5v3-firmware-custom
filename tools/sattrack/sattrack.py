@@ -331,15 +331,16 @@ def compute_passes(cfg, args):
 
 def print_passes(passes):
     now = datetime.now(timezone.utc)
-    print(f" {'#':>3}  {'Satellite':<9}  {'Start':<15} {'In':>7}  {'Len':>5}  {'Max':>3}  Direction")
+    print(f" {'#':>3}  {'Satellite':<9}  {'Start':<15} {'Starts in':>10}  {'Len':>5}  {'Max':>3}  Direction")
     for i, p in enumerate(passes, 1):
+        # a countdown, not a clock time: "in 17h37m", never "17h37"
         mins = int((p.aos - now).total_seconds() // 60)
-        when = f"{mins // 60}h{mins % 60:02d}" if mins >= 60 else f"{max(mins, 0)}m"
+        when = f"{mins // 60}h{mins % 60:02d}m" if mins >= 60 else f"{max(mins, 0)}m"
         note = ""
         if i > 1 and p.aos < passes[i - 2].los:
             note = f"  overlaps {i - 1}"
         tx = "" if p.sat.get("uplink") and p.sat.get("mode", "FM") == "FM" else "  RX"
-        print(f" {i:>3}  {p.sat['name']:<9}  {p.aos.astimezone():%a %d %H:%M:%S} {when:>7}  "
+        print(f" {i:>3}  {p.sat['name']:<9}  {p.aos.astimezone():%a %d %H:%M:%S} {when:>10}  "
               f"{p.minutes:4.1f}m  {p.max_el:3.0f}  {compass(p.aos_az):>2} > {compass(p.los_az):<2}{tx}{note}")
 
 

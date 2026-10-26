@@ -12,6 +12,10 @@ from .fmt import HDR_SIZE, PASS_COUNT, PPM_LIMIT, parse_header, parse_index  # n
 
 APP_SLOTS, APP_CODE_OFF, APP_ERR_MAGIC = 16, 0x1000, 2
 
+# Bytes per write command. 128-byte writes (about 150 bytes on the wire) fail
+# over the K-plug programming cable at 38400 baud, 64 works there and on USB-C.
+CHUNK = 64
+
 
 class Radio:
     def __init__(self, port):
@@ -25,19 +29,36 @@ class Radio:
         end = r.find(b"\0", 4, 20)
         self.version = r[4:end if end > 0 else 20].decode("ascii", "replace")
 
-    def call(self, mid, data, want, timeout=2.0):
-        self.ser.write(self.mm.make_packet(struct.pack("<HH", mid, len(data)) + data))
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            self.rx += self.ser.read(256)
-            while True:
-                m = self.mm.fetch(self.rx)
-                if m is None:
-                    break
-                if m.get_msg_type() == want:
-                    return bytes(m.buf)
+    def call(self, mid, data, want, timeout=2.0, retries=3):
+        """Send a command and wait for its reply. Every command used here is
+        safe to repeat (reads, erases, and rewriting the same bytes), so a
+        packet lost on a noisy serial cable is simply sent again."""
+        pkt = self.mm.make_packet(struct.pack("<HH", mid, len(data)) + data)
+        for _ in range(retries):
+            self.ser.reset_input_buffer()          # no late reply or echo from a previous try
+            self.rx.clear()
+            self.ser.write(pkt)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                self.rx += self.ser.read(self.ser.in_waiting or 1)
+                while self._whole():
+                    m = self.mm.fetch(self.rx)
+                    if m is None:
+                        break
+                    if m.get_msg_type() == want:
+                        return bytes(m.buf)
         raise TimeoutError(f"no answer from the radio (0x{mid:04X}). Is it on its main screen, "
                            "running firmware with Sat Track support?")
+
+    def _whole(self):
+        """False while rx holds the start of a packet that has not fully arrived.
+        fetch() would take it for a bad start and drop it, so it is called only
+        on whole packets. A packet is AB CD, a 16-bit length, the payload, the
+        CRC and DC BA: 8 bytes more than the length."""
+        i = self.rx.find(b"\xab\xcd")
+        if i < 0 or len(self.rx) < i + 4:
+            return True                            # nothing to cut, fetch() waits or clears noise
+        return len(self.rx) >= i + 8 + int.from_bytes(self.rx[i + 2:i + 4], "little")
 
     # ---- pass store ----
     def erase(self, sector):
@@ -46,8 +67,8 @@ class Radio:
             raise IOError(f"erase sector {sector}: status {r[5]}")
 
     def write(self, sector, data):
-        for off in range(0, len(data), 128):
-            chunk = data[off:off + 128]
+        for off in range(0, len(data), CHUNK):
+            chunk = data[off:off + CHUNK]
             if chunk.count(0xFF) == len(chunk):     # erased flash already reads 0xFF
                 continue
             r = self.call(0x0744, struct.pack("<BBIHI", sector, 0, off, len(chunk), self.ts) + chunk, 0x0745)
@@ -71,8 +92,9 @@ class Radio:
     def upload(self, index, blobs, verify=True, progress=print):
         """Erase, write passes, verify, then the index last: an interrupted
         upload leaves no valid index and the app shows NO PASSES."""
-        progress("erasing ...")
-        self.erase(0xFF)
+        for s in range(1 + PASS_COUNT):             # one sector per command: no long busy radio
+            progress(f"erasing {s + 1}/{1 + PASS_COUNT}")
+            self.erase(s)
         for i, b in enumerate(blobs):
             progress(f"writing pass {i + 1}/{len(blobs)}")
             self.write(1 + i, b)
@@ -142,8 +164,8 @@ class Radio:
         if r[5]:
             raise IOError(f"app slot {slot + 1} erase failed: status {r[5]}")
         for part, base in ((code, APP_CODE_OFF), (hdr, 0)):
-            for off in range(0, len(part), 128):
-                chunk = part[off:off + 128]
+            for off in range(0, len(part), CHUNK):
+                chunk = part[off:off + CHUNK]
                 r = self.call(0x0734, struct.pack("<BBIHI", slot, 0, base + off, len(chunk), self.ts) + chunk, 0x0735)
                 if r[5]:
                     raise IOError(f"app slot {slot + 1} write failed: status {r[5]}")

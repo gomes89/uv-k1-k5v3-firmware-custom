@@ -68,22 +68,27 @@ You can leave with **EXIT** during a pass. Come back and it carries on.
 |--------------|-------------------|-------------------------------|
 | MENU         | start now         |                               |
 | UP / DOWN    | choose a pass     | move 1 second later / earlier |
-| 0            | mark flown / not  | stop / resume the pass        |
+| 0            | mark flown / not  | hold / resume the pass        |
 | 3 / 9        |                   | tune up / down a little       |
 | 5            |                   | fix the timing (see below)    |
 | PTT          |                   | talk                          |
 | F, UP / DOWN | squelch up / down | squelch up / down             |
 | EXIT         | leave             | leave (the pass keeps going)  |
 
-**On the screen.** `EL45/67` is the elevation now and the highest it will
-get. On the sky plot, north is up and east is right; the solid line is the
-path so far and the dot is the satellite. The bar next to the signal level
-runs from -130 dBm (just noise) to -90 dBm (strong), and the thin mark on
-it is the strongest so far in this pass. The small arrows next to the pass
-number show you can browse passes.
+**On the screen.** The RX line shows the exact Doppler frequency, the radio
+retunes in small steps to follow it. `EL45/67` is the elevation now and the
+highest it will get. On the sky plot, north is up and east is right; the
+solid line is the path so far and the dot is the satellite. The bar next to
+the signal level runs from -133 dBm (noise) to -53 dBm (S9+40), with S9 in the
+middle, and the thin mark on it is the strongest so far in this pass. The
+small arrows next to the pass number show you can browse passes.
 
 A pass marked flown is skipped when the app picks the next pass. Press **0**
 again on it, any time, to clear the mark.
+
+**0 during a pass** holds the frequency where it is, handy to keep one SSTV
+image free of retunes. Press **0** again to resume: the frequency jumps back
+on track. After LOS the radio also stays on the last frequency.
 On the UV-K1, UP / DOWN are the LEFT / RIGHT keys.
 
 **Pressed MENU late?** A second or two does not matter. If the satellite

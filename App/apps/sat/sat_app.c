@@ -20,7 +20,8 @@
  * Downlink and uplink are both corrected from the same range rate.
  *
  * Keys: MENU start at AOS / next pass · UP/DOWN pick a pass, or move the pass
- *       1 s during it · 0 mark a pass flown (again: clear), or stop/resume it
+ *       1 s during it · 0 mark a pass flown (again: clear), or hold/resume it
+ *       (hold keeps the current frequency, resume jumps back on track)
  *       3/9 tune RX up/down · 5 resync (tuning -> timing) · F+UP/DOWN squelch
  *       PTT talk on the corrected uplink · EXIT quit (a running pass resumes).
  */
@@ -141,12 +142,20 @@ static void sampleAt(int32_t t){
     g.az=(uint16_t)(s->az*360u/256u);
     g.el=(uint16_t)(s->el/2u);
 }
+/* play_tone() ends with the audio path off and the AF muted, while the bridge
+ * still counts the audio as open, so it never turns it back on: with squelch 0,
+ * or a signal that never drops, the speaker stays silent. A full retune after
+ * the beep resets audio and squelch, the same as changing the squelch by hand. */
+static void beep(uint16_t hz,uint16_t ms){
+    A->play_tone(hz,ms);
+    A->sat_tune(g.rx,g.tx,g.P.ctcss_01hz,g.P.modulation);
+    g.tuned=g.rx;
+}
+/* ST_DONE (held with 0, or past LOS) keeps the last Doppler-corrected
+ * frequency and position: a signal still heard, or an SSTV image in progress,
+ * is not cut off by a jump back to nominal. */
 static void compute(void){
-    if(g.st==ST_DONE){
-        sampleAt((int32_t)endMs());
-        g.rx=g.P.dl_10hz; g.tx=g.P.ul_10hz;
-        return;
-    }
+    if(g.st==ST_DONE) return;
     g.tMs=g.st==ST_RUN?elapsedMs():0;
     sampleAt(g.tMs);
     g.rx=(uint32_t)((int32_t)g.P.dl_10hz-shift(g.P.k_dl,g.rr)+g.trim);
@@ -154,16 +163,29 @@ static void compute(void){
     if(g.st==ST_RUN && g.tMs>(int32_t)endMs()){        /* LOS */
         g.st=ST_DONE;
         g.used|=(uint16_t)(1u<<g.passNo);
-        g.trim=0;
-        g.rx=g.P.dl_10hz; g.tx=g.P.ul_10hz;
-        A->play_tone(880,200);
+        beep(880,200);
     }
 }
-/* Retune only past 300 Hz (FM) or 30 Hz (SSB): each retune relocks the PLL. */
+/* Each retune relocks the PLL and drops the audio for a few ms (a short line
+ * in SSTV), so retune as rarely as the mode allows. The downlink only falls
+ * during a pass, so a retune tunes half a step below the prediction: the
+ * error then sweeps from +half to -half before the next one, twice the
+ * spacing of tuning on the prediction for the same worst error.
+ * Worst error (half a step) in 10 Hz units, by modulation: FM 500 Hz, AM
+ * 250 Hz, USB/CW 30 Hz. On a high UHF pass that is a retune every ~5-10 s in
+ * FM near TCA. A forced retune (start, after TX, a trim or time change) tunes
+ * the prediction itself. */
+static const uint8_t HALF[3]={50u,25u,3u};
 static void retune(bool force){
     if(g.st==ST_EMPTY) return;
-    uint32_t d=g.rx>g.tuned?g.rx-g.tuned:g.tuned-g.rx;
-    if(force || d>=(g.P.modulation?3u:30u)){ A->sat_rx(g.rx); g.tuned=g.rx; }
+    const int32_t h=HALF[g.P.modulation<3u?g.P.modulation:2u];
+    const int32_t e=(int32_t)(g.rx-g.tuned);
+    uint32_t f=g.rx;
+    if(!force){
+        if(e>=-h && e<=h) return;
+        if(g.st==ST_RUN) f=g.rx-(uint32_t)h;
+    }
+    A->sat_rx(f); g.tuned=f;
 }
 static void loadPass(uint8_t n,uint8_t state){
     g.st=ST_EMPTY;
@@ -309,7 +331,7 @@ static void draw(uint8_t rf){
             a->print_tiny(e.los,0,32,false,true);
             /* bottom row stays left of the plot's S (x < 100) */
             if(g.st==ST_DONE){
-                F("%s MENU=NEXT",g.stopped?"STOP":"LOS ");
+                F("%s MENU=NEXT",g.stopped?"HOLD":"LOS ");
                 if(g.stopped) a->print_tiny("0=RESUME",0,40,false,true);
             } else {
                 F("MENU AT AOS");
@@ -322,7 +344,7 @@ static void draw(uint8_t rf){
         uint8_t n=e.n_plot;
         if((uint8_t)(n-2u)<=SAT_PLOT_POINTS-2u){
             uint8_t k=(uint8_t)(n-1u);           /* solid up to here */
-            if(g.st==ST_RUN && t/100u<end/100u) k=(uint8_t)((t/100u)*(n-1u)/(end/100u));
+            if((g.st==ST_RUN || g.stopped) && t/100u<end/100u) k=(uint8_t)((t/100u)*(n-1u)/(end/100u));
             for(uint8_t i=0;i<k;i++)
                 a->draw_line(a->fb,e.plot[i][0],e.plot[i][1],e.plot[i+1][0],e.plot[i+1][1],true);
             uint8_t m=g.st==ST_ARMED?0:k;
@@ -348,17 +370,17 @@ static void onKey(uint8_t key,bool repeat){
     }
     switch(g.st){
         case ST_ARMED:
-            if(key==APP_KEY_MENU){ g.t0=A->ticks_ms(); g.st=ST_RUN; A->play_tone(1000,60); }
+            if(key==APP_KEY_MENU){ g.t0=A->ticks_ms(); g.st=ST_RUN; beep(1000,60); }
             else if(dir) loadPass(findPass(g.passNo,dir,false),ST_ARMED);
             else if(key==APP_KEY_0) g.used^=(uint16_t)(1u<<g.passNo);      /* flown <-> not */
             break;
         case ST_RUN:
-            if(dir) g.t0-=(uint32_t)(dir*1000);
+            if(dir){ g.t0-=(uint32_t)(dir*1000); g.tuned=0; }   /* retune now */
             else if(key==APP_KEY_0){ g.used|=(uint16_t)(1u<<g.passNo); g.st=ST_DONE; g.stopped=true; }
             else if(key==APP_KEY_3 || key==APP_KEY_9){
                 int16_t s=g.P.modulation?1:10;                 /* 10 Hz SSB, 100 Hz FM */
                 int16_t t=(int16_t)(g.trim+(key==APP_KEY_3?s:-s));
-                if(uabs(t)<=TRIM_MAX) g.trim=t;
+                if(uabs(t)<=TRIM_MAX){ g.trim=t; g.tuned=0; }      /* heard at once */
             } else if(key==APP_KEY_5){
                 resync();
             }
